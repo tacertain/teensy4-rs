@@ -57,7 +57,9 @@ mod app {
 
     use usb_device::{
         bus::UsbBusAllocator,
-        device::{UsbDevice, UsbDeviceBuilder, UsbDeviceState, UsbVidPid},
+        device::{
+            StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbDeviceState, UsbVidPid,
+        },
     };
     use usbd_serial::SerialPort;
 
@@ -131,7 +133,8 @@ mod app {
         let usb_bus = cx.local.usb_bus.insert(UsbBusAllocator::new(bus_adapter));
         let usb_class = SerialPort::new(usb_bus);
         let usb_device = UsbDeviceBuilder::new(usb_bus, VID_PID)
-            .product(PRODUCT)
+            .strings(&[StringDescriptors::default().product(PRODUCT)])
+            .unwrap()
             .device_class(usbd_serial::USB_CLASS_CDC)
             .build();
 

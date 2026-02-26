@@ -289,6 +289,14 @@ pub struct Resources<Pins> {
     pub trng: hal::trng::Trng,
     /// Temperature monitor of the core.
     pub tempmon: hal::tempmon::TempMon,
+    /// The register block for SAI1 (I2S audio).
+    ///
+    /// SAI1 is the primary audio interface used by the Teensy Audio Shield.
+    pub sai1: ral::sai::SAI1,
+    /// The register block for SAI2.
+    pub sai2: ral::sai::SAI2,
+    /// The register block for SAI3.
+    pub sai3: ral::sai::SAI3,
 }
 
 /// The board's dedicated LED.
@@ -374,20 +382,18 @@ pub type Lpi2c3 = hal::lpi2c::Lpi2c<hal::lpi2c::Pins<pins::common::P16, pins::co
 /// - SDO:  GPIO_SD_B0_02 (p43) or GPIO_EMC_28 (p50)
 /// - SDI:  GPIO_SD_B0_03 (p42) or GPIO_EMC_29 (p54)
 /// - SCK:  GPIO_SD_B0_00 (p45) or GPIO_EMC_27 (p49)
-/// - PCS0: GPIO_SD_B0_01 (p44) or GPIO_EMC_30
 ///
 /// Use [`lpspi`] to create this driver.
-pub type Lpspi1<SDO, SDI, SCK, PCS0> = hal::lpspi::Lpspi<LpspiPins<SDO, SDI, SCK, PCS0>, 1>;
+pub type Lpspi1<SDO, SDI, SCK> = hal::lpspi::Lpspi<LpspiPins<SDO, SDI, SCK>, 1>;
 
 /// LPSPI2 peripheral.
 ///
 /// - SDO:  GPIO_SD_B1_08 or GPIO_EMC_02
 /// - SDI:  GPIO_SD_B1_09 or GPIO_EMC_03
 /// - SCK:  GPIO_SD_B1_07 or GPIO_EMC_00
-/// - PCS0: GPIO_SD_B1_06 or GPIO_EMC_01
 ///
 /// Use [`lpspi`] to create this driver.
-pub type Lpspi2<SDO, SDI, SCK, PCS0> = hal::lpspi::Lpspi<LpspiPins<SDO, SDI, SCK, PCS0>, 2>;
+pub type Lpspi2<SDO, SDI, SCK> = hal::lpspi::Lpspi<LpspiPins<SDO, SDI, SCK>, 2>;
 
 /// LPSPI3 peripheral.
 ///
@@ -396,11 +402,10 @@ pub type Lpspi2<SDO, SDI, SCK, PCS0> = hal::lpspi::Lpspi<LpspiPins<SDO, SDI, SCK
 /// - Pin 26 is data out (SDO).
 /// - Pin 39 or 1 is data in (SDI).
 /// - Pin 27 is clock (SCK).
-/// - Pin 0 or 38 is chip select (CS).
 ///
 /// Use [`lpspi`] to create this driver.
-pub type Lpspi3<SDI, CS> =
-    hal::lpspi::Lpspi<LpspiPins<pins::common::P26, SDI, pins::common::P27, CS>, 3>;
+pub type Lpspi3<SDI> =
+    hal::lpspi::Lpspi<LpspiPins<pins::common::P26, SDI, pins::common::P27>, 3>;
 
 /// LPSPI4 peripheral.
 ///
@@ -411,7 +416,7 @@ pub type Lpspi3<SDI, CS> =
 ///
 /// Use [`lpspi`] to create this driver.
 pub type Lpspi4 = hal::lpspi::Lpspi<
-    LpspiPins<pins::common::P11, pins::common::P12, pins::common::P13, pins::common::P10>,
+    LpspiPins<pins::common::P11, pins::common::P12, pins::common::P13>,
     4,
 >;
 
@@ -435,16 +440,15 @@ pub type Lpspi4 = hal::lpspi::Lpspi<
 ///         sdo: pins.p11,
 ///         sdi: pins.p12,
 ///         sck: pins.p13,
-///         pcs0: pins.p10,
 ///     },
 ///     1_000_000,
 /// );
 /// ```
-pub fn lpspi<Sdo, Sdi, Sck, Pcs0, const N: u8>(
+pub fn lpspi<Sdo, Sdi, Sck, const N: u8>(
     instance: ral::lpspi::Instance<N>,
-    pins: LpspiPins<Sdo, Sdi, Sck, Pcs0>,
+    pins: LpspiPins<Sdo, Sdi, Sck>,
     baud: u32,
-) -> hal::lpspi::Lpspi<LpspiPins<Sdo, Sdi, Sck, Pcs0>, N>
+) -> hal::lpspi::Lpspi<LpspiPins<Sdo, Sdi, Sck>, N>
 where
     Sdo: hal::iomuxc::lpspi::Pin<
         Signal = hal::iomuxc::lpspi::Sdo,
@@ -456,10 +460,6 @@ where
     >,
     Sck: hal::iomuxc::lpspi::Pin<
         Signal = hal::iomuxc::lpspi::Sck,
-        Module = hal::iomuxc::consts::Const<N>,
-    >,
-    Pcs0: hal::iomuxc::lpspi::Pin<
-        Signal = hal::iomuxc::lpspi::Pcs0,
         Module = hal::iomuxc::consts::Const<N>,
     >,
 {
@@ -675,6 +675,9 @@ fn prepare_resources<Pins>(
         adc2,
         trng,
         tempmon,
+        sai1: instances.SAI1,
+        sai2: instances.SAI2,
+        sai3: instances.SAI3,
     }
 }
 

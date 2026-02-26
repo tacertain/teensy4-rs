@@ -65,11 +65,11 @@ members = [
 
 [workspace.dependencies]
 imxrt-boot-gen = { version = "0.3.0", features = ["imxrt1060"] }
-imxrt-hal = { version = "0.5.3", features = ["imxrt1060"] }
-imxrt-iomuxc = { version = "0.2.0", features = ["imxrt1060"] }
-imxrt-log = { version = "0.1" }
-imxrt-ral = { version = "0.5", features = ["imxrt1062"] }
-imxrt-rt = { version = "0.1.4", features = ["device"] }
+imxrt-hal = { path = "../imxrt-hal", features = ["imxrt1060"] }
+imxrt-iomuxc = { version = "0.3.0", features = ["imxrt1060"] }
+imxrt-log = { path = "../imxrt-hal/logging", default-features = false }
+imxrt-ral = { path = "../imxrt-ral", features = ["imxrt1062"] }
+imxrt-rt = { version = "0.1.5", features = ["device"] }
 
 [features]
 rt = ["dep:imxrt-rt", "imxrt-ral/rt"]
@@ -101,8 +101,8 @@ log = "0.4"
 nb = "1"
 rtic = { version = "2", features = ["thumbv7-backend"] }
 rtic-monotonics = { version = "1", default-features = false, features = ["cortex-m-systick"] }
-usb-device = "0.2"
-usbd-serial = "0.1"
+usb-device = "0.3"
+usbd-serial = "0.2"
 
 [[example]]
 name = "blocking_gpt"
@@ -151,3 +151,17 @@ required-features = ["rt"]
 [[example]]
 name = "rtic_usb_log"
 required-features = ["rt"]
+
+[[example]]
+name = "rtic_sai_dma_tone"
+required-features = ["rt"]
+
+[[example]]
+name = "rtic_sai_poll_tone"
+required-features = ["rt"]
+
+[patch.crates-io.imxrt-ral]
+path = "../imxrt-ral"
+
+[patch.crates-io.imxrt-iomuxc]
+git = "https://github.com/imxrt-rs/imxrt-iomuxc"

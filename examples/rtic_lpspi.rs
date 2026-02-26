@@ -35,7 +35,7 @@ mod app {
     /// These resources are local to individual tasks.
     #[local]
     struct Local {
-        lpspi3: board::Lpspi3<teensy4_bsp::pins::common::P1, teensy4_bsp::pins::common::P0>,
+        lpspi3: board::Lpspi3<teensy4_bsp::pins::common::P1>,
 
         /// Note: lpspi4 SCK is on pin 13 which collides with the Teensy 4/4.1 LED
         lpspi4: board::Lpspi4,
@@ -64,7 +64,6 @@ mod app {
                 sdo: pins.p26,
                 sdi: pins.p1,
                 sck: pins.p27,
-                pcs0: pins.p0,
             },
             1_000_000,
         );
@@ -79,7 +78,6 @@ mod app {
                 sdo: pins.p11,
                 sdi: pins.p12,
                 sck: pins.p13,
-                pcs0: pins.p10,
             },
             1_000_000,
         );
