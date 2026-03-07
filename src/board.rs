@@ -399,14 +399,15 @@ pub type Lpspi2<SDO, SDI, SCK> = hal::lpspi::Lpspi<LpspiPins<SDO, SDI, SCK>, 2>;
 
 /// LPSPI3 peripheral.
 ///
-/// CS and SDI have two options each for which pin to use.
+/// SDI has two options for which pin to use.
 ///
 /// - Pin 26 is data out (SDO).
 /// - Pin 39 or 1 is data in (SDI).
 /// - Pin 27 is clock (SCK).
 ///
 /// Use [`lpspi`] to create this driver.
-pub type Lpspi3<SDI> = hal::lpspi::Lpspi<LpspiPins<pins::common::P26, SDI, pins::common::P27>, 3>;
+pub type Lpspi3<SDI> =
+    hal::lpspi::Lpspi<LpspiPins<pins::common::P26, SDI, pins::common::P27>, 3>;
 
 /// LPSPI4 peripheral.
 ///
@@ -415,8 +416,10 @@ pub type Lpspi3<SDI> = hal::lpspi::Lpspi<LpspiPins<pins::common::P26, SDI, pins:
 /// - Pin 13 is clock (SCK).
 ///
 /// Use [`lpspi`] to create this driver.
-pub type Lpspi4 =
-    hal::lpspi::Lpspi<LpspiPins<pins::common::P11, pins::common::P12, pins::common::P13>, 4>;
+pub type Lpspi4 = hal::lpspi::Lpspi<
+    LpspiPins<pins::common::P11, pins::common::P12, pins::common::P13>,
+    4,
+>;
 
 /// Create a LPSPI peripheral.
 ///

@@ -55,6 +55,15 @@ optional = true
 version = "0.3.1"
 path = "teensy4-pins"
 
+# smoltcp is pulled transitively via imxrt-hal -> imxrt-enet.
+# imxrt-enet only enables medium-ethernet + proto-ipv4, which activates
+# smoltcp's "socket" feature without any socket types, causing a compile_error.
+# We add at least one socket type to satisfy it.
+[dependencies.smoltcp]
+version = "0.12"
+default-features = false
+features = ["socket-tcp"]
+
 [workspace]
 members = [
     "teensy4-fcb",
@@ -96,8 +105,9 @@ features = ["log"]
 defmt = "0.3"
 defmt-bbq = "0.1"
 embedded-hal = "0.2"
-imxrt-log = { workspace = true, default-features = false, features = ["usbd", "log"] }
+imxrt-log = { workspace = true, features = ["usbd", "log"] }
 log = "0.4"
+usb-device = { version = "0.3", features = ["test-class-high-speed"] }
 nb = "1"
 rtic = { version = "2", features = ["thumbv7-backend"] }
 rtic-monotonics = { version = "1", default-features = false, features = ["cortex-m-systick"] }
@@ -161,13 +171,16 @@ name = "rtic_sai_poll_tone"
 required-features = ["rt"]
 
 [patch.crates-io.imxrt-hal]
-git = "https://github.com/imxrt-rs/imxrt-hal"
+path = "../imxrt-hal"
 
 [patch.crates-io.imxrt-log]
-git = "https://github.com/imxrt-rs/imxrt-hal"
+path = "../imxrt-hal"
 
-[patch.crates-io.imxrt-ral]
-git = "https://github.com/imxrt-rs/imxrt-ral"
+[patch.crates-io.imxrt-enet]
+git = "https://github.com/mciantyre/imxrt-enet"
 
 [patch.crates-io.imxrt-iomuxc]
 git = "https://github.com/imxrt-rs/imxrt-iomuxc"
+
+[patch.crates-io.imxrt-ral]
+path = "../imxrt-ral"
