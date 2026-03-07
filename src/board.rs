@@ -299,6 +299,14 @@ pub struct Resources<Pins> {
     pub sai3: ral::sai::SAI3,
     /// The IOMUXC general purpose register block.
     pub iomuxc_gpr: ral::iomuxc_gpr::IOMUXC_GPR,
+    /// The ENET1 peripheral instance.
+    ///
+    /// Use this with the `imxrt-enet` crate or `hal::enet` to create
+    /// an Ethernet driver. See [`ENET_IPG_FREQUENCY`] and [`ENET_MAC`]
+    /// for board-level constants, and [`configure_enet_pins`],
+    /// [`configure_enet_rmii_pins`], [`reset_enet_phy`], and
+    /// [`init_enet_phy`] for Teensy 4.1-specific helpers.
+    pub enet1: ral::enet::ENET1,
 }
 
 /// The board's dedicated LED.
@@ -677,6 +685,7 @@ fn prepare_resources<Pins>(
         sai2: instances.SAI2,
         sai3: instances.SAI3,
         iomuxc_gpr: instances.IOMUXC_GPR,
+        enet1: instances.ENET1,
     }
 }
 
@@ -702,4 +711,167 @@ pub fn t41(instances: impl Into<Instances>) -> T41Resources {
 /// `init::Context` object -- can be used as the argument to this function.
 pub fn tmm(instances: impl Into<Instances>) -> TMMResources {
     prepare_resources(instances.into(), pins::tmm::from_pads)
+}
+
+// --------------------------------------------------------------------------
+//  Ethernet (ENET) board support — Teensy 4.1
+// --------------------------------------------------------------------------
+
+/// Default MAC address with PJRC OUI prefix (04:E9:E5).
+///
+/// Applications may override this with their own unique address.
+pub const ENET_MAC: [u8; 6] = [0x04, 0xE9, 0xE5, 0x14, 0xA5, 0x01];
+
+// DP83825I PHY constants
+const PHY_ADDR: u8 = 0;
+const PHY_PHYIDR1: u8 = 0x02;
+const PHY_PHYIDR2: u8 = 0x03;
+const PHY_RCSR: u8 = 0x17;
+const PHY_LEDCR: u8 = 0x18;
+const DP83825I_ID1: u16 = 0x2000;
+const DP83825I_ID2_MASKED: u16 = 0xA140;
+const PHY_RCSR_VALUE: u16 = 0x0081;
+const PHY_LEDCR_VALUE: u16 = 0x0680;
+
+// IOMUXC pad configuration constants
+const STRAP_PAD_PULLDOWN: u32 = 0x3038;
+const STRAP_PAD_PULLUP: u32 = 0xF028;
+const GPIO_PAD_OUTPUT: u32 = 0x0038;
+const MDIO_PAD_PULLUP: u32 = 0xF829;
+const RMII_PAD_PULLUP: u32 = 0xB0E9;
+const RMII_PAD_CLOCK: u32 = 0x0031;
+const GPIO_MUX: u32 = 5;
+const MDIO_MUX: u32 = 0;
+const RMII_MUX: u32 = 3;
+
+/// Configure strap pins, PHY reset/power GPIOs, and MDIO/MDC for the
+/// Teensy 4.1 on-board DP83825I Ethernet PHY.
+///
+/// Call this before powering on the PHY so that strap pin pull
+/// resistors are latched correctly during the hardware reset.
+///
+/// # Safety
+///
+/// The caller must ensure exclusive access to the IOMUXC and GPIO7
+/// register blocks for the pads used here (GPIO_B0_14, GPIO_B0_15,
+/// GPIO_B1_04–06, GPIO_B1_10–11, GPIO_B1_14–15). These are internal
+/// board connections to the Ethernet PHY and are not exposed on the
+/// Teensy 4.1 header.
+pub unsafe fn configure_enet_pins() {
+    let iomuxc = ral::iomuxc::IOMUXC::instance();
+    let gpio7 = ral::gpio::GPIO7::instance();
+
+    // Strap pins (configure BEFORE PHY power-on)
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_04, STRAP_PAD_PULLDOWN); // PhyAdd[0]=0
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_06, STRAP_PAD_PULLDOWN); // PhyAdd[1]=0
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_05, STRAP_PAD_PULLUP);   // RMII Slave
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_11, STRAP_PAD_PULLDOWN); // Auto MDIX
+
+    // PHY Reset and Power GPIO pins
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B0_15, GPIO_PAD_OUTPUT); // INT/PWRDN
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B0_15, GPIO_MUX);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B0_14, GPIO_PAD_OUTPUT); // RST_N
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B0_14, GPIO_MUX);
+
+    // GPIO7 bits 14,15 as outputs; power down PHY initially
+    ral::modify_reg!(ral::gpio, gpio7, GDIR, |gdir| gdir | (1 << 15) | (1 << 14));
+    ral::write_reg!(ral::gpio, gpio7, DR_CLEAR, 1 << 15);
+    ral::write_reg!(ral::gpio, gpio7, DR_SET, 1 << 14);
+
+    // MDIO / MDC pins
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_15, MDIO_PAD_PULLUP);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_14, RMII_PAD_PULLUP);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B1_15, MDIO_MUX);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B1_14, MDIO_MUX);
+    ral::write_reg!(ral::iomuxc, iomuxc, ENET_MDIO_SELECT_INPUT, 2);
+
+    // Reference clock pin (must be present before PHY power-on)
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_10, RMII_PAD_CLOCK);
+    // RMII_MUX_CLOCK
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B1_10, MUX_MODE: 6, SION: 1);
+}
+
+/// Configure RMII data pins for the Teensy 4.1 Ethernet PHY.
+///
+/// Call this **after** PHY initialization so that strap pin pad
+/// values have already been latched.
+///
+/// # Safety
+///
+/// Same requirements as [`configure_enet_pins`].
+pub unsafe fn configure_enet_rmii_pins() {
+    let iomuxc = ral::iomuxc::IOMUXC::instance();
+
+    // Pad settings for all RMII data pins
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_04, RMII_PAD_PULLUP); // RXD0
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_05, RMII_PAD_PULLUP); // RXD1
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_06, RMII_PAD_PULLUP); // RXEN
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_11, RMII_PAD_PULLUP); // RXER
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_07, RMII_PAD_PULLUP); // TXD0
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_08, RMII_PAD_PULLUP); // TXD1
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_B1_09, RMII_PAD_PULLUP); // TXEN
+
+    // Mux all RMII data pins to ALT3
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B1_04, RMII_MUX); // RXD0
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B1_05, RMII_MUX); // RXD1
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B1_11, RMII_MUX); // RXER
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B1_06, RMII_MUX); // RXEN
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B1_09, RMII_MUX); // TXEN
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B1_07, RMII_MUX); // TXD0
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_B1_08, RMII_MUX); // TXD1
+
+    // Input daisy chains
+    ral::write_reg!(ral::iomuxc, iomuxc, ENET_IPG_CLK_RMII_SELECT_INPUT, 1); // GPIO_B1_10_ALT6
+    ral::write_reg!(ral::iomuxc, iomuxc, ENET0_RXDATA_SELECT_INPUT, 1);       // GPIO_B1_04_ALT3
+    ral::write_reg!(ral::iomuxc, iomuxc, ENET1_RXDATA_SELECT_INPUT, 1);       // GPIO_B1_05_ALT3
+    ral::write_reg!(ral::iomuxc, iomuxc, ENET_RXEN_SELECT_INPUT, 1);          // GPIO_B1_06_ALT3
+    ral::write_reg!(ral::iomuxc, iomuxc, ENET_RXERR_SELECT_INPUT, 1);         // GPIO_B1_11_ALT3
+}
+
+/// Power-on and hardware-reset the DP83825I PHY on the Teensy 4.1.
+///
+/// Uses GPIO7 to control the PHY power (bit 15) and reset (bit 14)
+/// lines. The `delay` closure receives milliseconds.
+///
+/// # Safety
+///
+/// Caller must ensure exclusive access to GPIO7, and
+/// [`configure_enet_pins`] must have been called first.
+pub unsafe fn reset_enet_phy(delay: &mut impl FnMut(u32)) {
+    let gpio7 = ral::gpio::GPIO7::instance();
+
+    ral::write_reg!(ral::gpio, gpio7, DR_SET, 1 << 15);  // power on
+    delay(50);
+    ral::write_reg!(ral::gpio, gpio7, DR_CLEAR, 1 << 14); // assert reset
+    delay(1);
+    ral::write_reg!(ral::gpio, gpio7, DR_SET, 1 << 14);  // release reset
+    delay(2);
+}
+
+/// Initialize the DP83825I PHY via MDIO.
+///
+/// Verifies the PHY ID, configures RMII clock select, and sets LED
+/// mode. Auto-negotiation is left enabled (PHY default).
+pub fn init_enet_phy<M>(mdio: &mut M) -> Result<(), &'static str>
+where
+    M: hal::enet::MiimRead<Error = hal::enet::MiiError>
+        + hal::enet::MiimWrite<Error = hal::enet::MiiError>,
+{
+    let id1 = mdio
+        .read(PHY_ADDR, PHY_PHYIDR1)
+        .map_err(|_| "MDIO read PHYIDR1 failed")?;
+    let id2 = mdio
+        .read(PHY_ADDR, PHY_PHYIDR2)
+        .map_err(|_| "MDIO read PHYIDR2 failed")?;
+
+    if id1 != DP83825I_ID1 || (id2 & 0xFFF0) != DP83825I_ID2_MASKED {
+        return Err("DP83825I PHY not detected");
+    }
+
+    mdio.write(PHY_ADDR, PHY_LEDCR, PHY_LEDCR_VALUE)
+        .map_err(|_| "MDIO write LEDCR failed")?;
+    mdio.write(PHY_ADDR, PHY_RCSR, PHY_RCSR_VALUE)
+        .map_err(|_| "MDIO write RCSR failed")?;
+
+    Ok(())
 }

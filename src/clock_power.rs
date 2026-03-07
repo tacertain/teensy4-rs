@@ -238,6 +238,7 @@ const CLOCK_GATES: &[clock_gate::Locator] = &[
     clock_gate::gpio::<4>(),
     clock_gate::usb(),
     clock_gate::dma(),
+    clock_gate::enet(),
     clock_gate::snvs_lp(),
     clock_gate::snvs_hp(),
     clock_gate::lpi2c::<1>(),
@@ -289,8 +290,57 @@ pub fn prepare_clocks_and_power(
     setup_uart_clk(ccm);
     setup_audio_pll(ccm_analog);
     setup_sai1_clk(ccm);
+    setup_enet_pll(ccm_analog);
 
     CLOCK_GATES
         .iter()
         .for_each(|locator| locator.set(ccm, clock_gate::ON));
+}
+
+/// Frequency (Hz) of the ENET IPG bus clock.
+///
+/// This is the same as `IPG_FREQUENCY` (150 MHz). Use this when
+/// constructing an ENET driver that needs the bus clock frequency.
+pub const ENET_IPG_FREQUENCY: u32 = IPG_FREQUENCY;
+
+/// Enable PLL6 (ENET PLL) for 50 MHz RMII reference clock output.
+///
+/// Also configures IOMUXC_GPR1 to drive the reference clock from
+/// PLL6 out to the PHY on the Teensy 4.1.
+fn setup_enet_pll(ccm_analog: &mut ral::ccm_analog::CCM_ANALOG) {
+    // Configure PLL6 for 50 MHz output:
+    //   DIV_SELECT: 0→25MHz, 1→50MHz, 2→100MHz, 3→125MHz
+
+    // 1. Bypass PLL
+    ral::write_reg!(ral::ccm_analog, ccm_analog, PLL_ENET_SET, BYPASS: 1);
+
+    // 2. Clear config bits (BYPASS_CLK_SRC, ENET2_DIV_SELECT, DIV_SELECT)
+    ral::write_reg!(ral::ccm_analog, ccm_analog, PLL_ENET_CLR,
+        BYPASS_CLK_SRC: 0b11, ENET2_DIV_SELECT: 0b11, DIV_SELECT: 0b11
+    );
+
+    // 3. Enable PLL + 25MHz ref + set DIV_SELECT=1 (50MHz)
+    ral::write_reg!(ral::ccm_analog, ccm_analog, PLL_ENET_SET,
+        ENET_25M_REF_EN: 1, ENABLE: 1, DIV_SELECT: 1
+    );
+
+    // 4. Power up (clear POWERDOWN)
+    ral::write_reg!(ral::ccm_analog, ccm_analog, PLL_ENET_CLR, POWERDOWN: 1);
+
+    // 5. Wait for PLL lock
+    while ral::read_reg!(ral::ccm_analog, ccm_analog, PLL_ENET, LOCK == 0) {}
+
+    // 6. Disable bypass
+    ral::write_reg!(ral::ccm_analog, ccm_analog, PLL_ENET_CLR, BYPASS: 1);
+
+    // Configure IOMUXC_GPR1: drive ENET1 REFCLK from PLL6 to PHY
+    //   ENET1_CLK_SEL=0 — use ref_enetpll, not external
+    //   ENET_IPG_CLK_S_EN=1 — enable IPG clock to ENET
+    //   ENET1_TX_CLK_DIR=1 — output clock to PHY
+    let gpr = unsafe { ral::iomuxc_gpr::IOMUXC_GPR::instance() };
+    ral::modify_reg!(ral::iomuxc_gpr, gpr, GPR1,
+        ENET1_CLK_SEL: 0,
+        ENET_IPG_CLK_S_EN: 1,
+        ENET1_TX_CLK_DIR: 1
+    );
 }
