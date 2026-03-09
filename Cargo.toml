@@ -152,6 +152,14 @@ required-features = ["rt"]
 name = "rtic_usb_log"
 required-features = ["rt"]
 
+[[example]]
+name = "rtic_sai_dma_tone"
+required-features = ["rt"]
+
+[[example]]
+name = "rtic_sai_poll_tone"
+required-features = ["rt"]
+
 [patch.crates-io.imxrt-hal]
 git = "https://github.com/imxrt-rs/imxrt-hal"
 
