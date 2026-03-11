@@ -130,6 +130,10 @@ name = "blocking_pit"
 required-features = ["rt"]
 
 [[example]]
+name = "blocking_psram"
+required-features = ["rt"]
+
+[[example]]
 name = "blocking_uart"
 required-features = ["rt"]
 
