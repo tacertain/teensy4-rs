@@ -26,6 +26,7 @@
 //! | Flag            |         Description                          |
 //! | --------------- | -------------------------------------------- |
 //! | `"rt"`          | Adds runtime support using `imxrt-rt`.       |
+//! | `"psram"`       | Adds PSRAM support for the Teensy 4.1.       |
 //!
 //! # Runtime
 //!
@@ -61,6 +62,21 @@
 //! TEENSY4_STACK_SIZE=4k     # Convenience for multiples of 1024 bytes.
 //! TEENSY4_STACK_SIZE=4K     # Equivalent to the above.
 //! ```
+//!
+//! # PSRAM (Teensy 4.1)
+//!
+//! When the `psram` feature is enabled, `teensy4-bsp` provides safe access
+//! to the Teensy 4.1's external PSRAM (up to 16 MB via FlexSPI2).
+//!
+//! Use [`psram_static!`] to declare typed statics in PSRAM, and
+//! [`board::initialize_psram`] to initialize the hardware and copy
+//! initializers from flash. Access statics via the `.take(token)` method,
+//! which follows the `static_cell` one-shot pattern.
+//!
+//! The `psram` feature emits a supplementary linker script (`psram.x`)
+//! that defines the `.psram.data` section. Initializer data for PSRAM
+//! statics is stored in flash — large initializers consume corresponding
+//! flash space (there is no `.psram.bss` zero-fill optimization).
 //!
 //! # Notes
 //!
@@ -111,6 +127,11 @@ pub use ral::{interrupt, Interrupt, NVIC_PRIO_BITS};
 
 pub mod board;
 mod clock_power;
+
+#[cfg(feature = "psram")]
+mod psram;
+#[cfg(feature = "psram")]
+pub use psram::{PsramData, PsramStatic};
 
 /// SYSTICK external clock frequency.
 ///

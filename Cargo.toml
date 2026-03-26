@@ -73,6 +73,7 @@ imxrt-rt = { version = "0.1.5", features = ["device"] }
 
 [features]
 rt = ["dep:imxrt-rt", "imxrt-ral/rt"]
+psram = []
 
 # Don't optimize build dependencies, like proc macros.
 # Helps with build times.
@@ -121,6 +122,10 @@ name = "blocking_pit"
 required-features = ["rt"]
 
 [[example]]
+name = "blocking_psram"
+required-features = ["rt", "psram"]
+
+[[example]]
 name = "blocking_uart"
 required-features = ["rt"]
 
@@ -161,10 +166,10 @@ name = "rtic_sai_poll_tone"
 required-features = ["rt"]
 
 [patch.crates-io.imxrt-hal]
-git = "https://github.com/imxrt-rs/imxrt-hal"
+path = "../imxrt-hal"
 
 [patch.crates-io.imxrt-log]
-git = "https://github.com/imxrt-rs/imxrt-hal"
+path = "../imxrt-hal/logging"
 
 [patch.crates-io.imxrt-ral]
 git = "https://github.com/imxrt-rs/imxrt-ral"

@@ -299,6 +299,13 @@ pub struct Resources<Pins> {
     pub sai3: ral::sai::SAI3,
     /// The IOMUXC general purpose register block.
     pub iomuxc_gpr: ral::iomuxc_gpr::IOMUXC_GPR,
+    /// The FlexSPI2 peripheral instance.
+    ///
+    /// On the Teensy 4.1, FlexSPI2 is connected to the on-board PSRAM
+    /// chip(s). Pass this to [`initialize_psram`] (or [`init_psram`])
+    /// to initialize PSRAM; doing so consumes the instance, preventing
+    /// accidental misuse of the peripheral after initialization.
+    pub flexspi2: ral::flexspi::FLEXSPI2,
 }
 
 /// The board's dedicated LED.
@@ -677,6 +684,7 @@ fn prepare_resources<Pins>(
         sai2: instances.SAI2,
         sai3: instances.SAI3,
         iomuxc_gpr: instances.IOMUXC_GPR,
+        flexspi2: instances.FLEXSPI2,
     }
 }
 
@@ -702,4 +710,395 @@ pub fn t41(instances: impl Into<Instances>) -> T41Resources {
 /// `init::Context` object -- can be used as the argument to this function.
 pub fn tmm(instances: impl Into<Instances>) -> TMMResources {
     prepare_resources(instances.into(), pins::tmm::from_pads)
+}
+
+// --------------------------------------------------------------------------
+//  PSRAM (FlexSPI2) board support — Teensy 4.1
+// --------------------------------------------------------------------------
+
+/// Zero-sized token proving that PSRAM has been initialized.
+///
+/// Returned by [`initialize_psram`] on success. Pass this to
+/// [`PsramStatic::take`](crate::PsramStatic::take) to obtain
+/// references to PSRAM-backed statics declared with
+/// [`psram_static!`](crate::psram_static).
+///
+/// `Copy` so it can be passed to `.take()` on multiple independent
+/// statics. One-shot safety is enforced per-static via `AtomicBool`,
+/// not by the token.
+#[derive(Clone, Copy, Debug)]
+pub struct PsramToken(());
+
+/// Errors from [`initialize_psram`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PsramError {
+    /// No PSRAM chip was detected on FlexSPI2.
+    NotDetected,
+    /// The `.psram.data` section is larger than the detected PSRAM capacity.
+    SectionOverflow {
+        /// Size of the `.psram.data` section in bytes.
+        section_size: usize,
+        /// Detected PSRAM capacity in bytes.
+        detected_size: usize,
+    },
+}
+
+/// Initialize PSRAM and copy initializer data from flash.
+///
+/// Configures FlexSPI2, detects installed PSRAM, and copies the
+/// `.psram.data` section contents from flash (LMA) into PSRAM (VMA).
+/// On success, returns a [`PsramToken`] that can be used to access
+/// PSRAM-backed statics.
+///
+/// Consumes the `FLEXSPI2` instance to prevent further direct use
+/// of the peripheral after initialization.
+///
+/// # Errors
+///
+/// Returns [`PsramError::NotDetected`] if no PSRAM chip responds.
+/// Returns [`PsramError::SectionOverflow`] if the `.psram.data`
+/// section is larger than the detected capacity.
+///
+/// # Safety
+///
+/// Must be called once during early initialization, before any PSRAM
+/// access. Modifies IOMUXC and FlexSPI2 peripheral registers. The
+/// FlexSPI2 clock must already be configured (this is done
+/// automatically by [`prepare_clocks_and_power`]).
+#[cfg(feature = "psram")]
+pub unsafe fn initialize_psram(
+    flexspi2: ral::flexspi::FLEXSPI2,
+) -> Result<PsramToken, PsramError> {
+    let size_mb = init_psram(flexspi2);
+    if size_mb == 0 {
+        return Err(PsramError::NotDetected);
+    }
+
+    let detected_bytes = size_mb as usize * 1024 * 1024;
+
+    // Linker-provided symbols from psram.x.
+    //
+    // Assumptions (see docs/psram-api-design.md "Assumptions and Fragility"):
+    // - psram.x defines these symbols via the .psram.data section.
+    // - psram.x uses `AT> FLASH` which requires t4link.x (imxrt-rt) to
+    //   define a FLASH region. If imxrt-rt renames it, linking fails.
+    // - psram.x uses `INSERT AFTER .uninit` which requires t4link.x to
+    //   define a .uninit section. If imxrt-rt removes it, linking fails.
+    // - VMA is at 0x7000_0000 (PSRAM memory-mapped base).
+    extern "C" {
+        static __spsram_data: u8;
+        static __epsram_data: u8;
+        static __sipsram_data: u8;
+    }
+
+    let vma_start = &__spsram_data as *const u8;
+    let vma_end = &__epsram_data as *const u8;
+    let lma_start = &__sipsram_data as *const u8;
+    let section_size = vma_end as usize - vma_start as usize;
+
+    if section_size > detected_bytes {
+        return Err(PsramError::SectionOverflow {
+            section_size,
+            detected_size: detected_bytes,
+        });
+    }
+
+    // Copy initializer data from flash to PSRAM.
+    if section_size > 0 {
+        core::ptr::copy_nonoverlapping(lma_start, vma_start as *mut u8, section_size);
+    }
+
+    Ok(PsramToken(()))
+}
+
+/// PSRAM memory-mapped base address.
+///
+/// After [`init_psram`] returns successfully, PSRAM is accessible
+/// as normal memory starting at this address.
+pub const PSRAM_BASE: usize = 0x7000_0000;
+
+/// Maximum PSRAM size in bytes (8 MB per chip, up to 16 MB with two chips).
+pub const PSRAM_MAX_SIZE: usize = 16 * 1024 * 1024;
+
+// --- FlexSPI LUT instruction encoding ---
+// These constants encode FlexSPI protocol instructions, not register fields.
+
+const FLEXSPI_CMD_SDR: u32 = 0x01;
+const FLEXSPI_RADDR_SDR: u32 = 0x02;
+const FLEXSPI_READ_SDR: u32 = 0x09;
+const FLEXSPI_WRITE_SDR: u32 = 0x08;
+const FLEXSPI_DUMMY_SDR: u32 = 0x0C;
+
+const FLEXSPI_PADS_1: u32 = 0;
+const FLEXSPI_PADS_4: u32 = 2;
+
+const fn lut_instr(opcode: u32, pads: u32, operand: u32) -> u32 {
+    (opcode << 10) | (pads << 8) | operand
+}
+
+const fn lut_word(instr0: u32, instr1: u32) -> u32 {
+    instr0 | (instr1 << 16)
+}
+
+unsafe fn flexspi2_command(
+    flexspi2: &ral::flexspi::Instance<2>,
+    seq_index: u32,
+    addr: u32,
+) {
+    ral::write_reg!(ral::flexspi, flexspi2, IPCR0, SFAR: addr);
+    ral::write_reg!(ral::flexspi, flexspi2, IPCR1, ISEQID: seq_index);
+    ral::write_reg!(ral::flexspi, flexspi2, IPCMD, TRG: 1);
+    while ral::read_reg!(ral::flexspi, flexspi2, INTR, IPCMDDONE) == 0 {}
+    ral::write_reg!(ral::flexspi, flexspi2, INTR, IPCMDDONE: 1);
+}
+
+unsafe fn flexspi2_psram_id(
+    flexspi2: &ral::flexspi::Instance<2>,
+    addr: u32,
+) -> u32 {
+    ral::write_reg!(ral::flexspi, flexspi2, IPCR0, SFAR: addr);
+    ral::write_reg!(ral::flexspi, flexspi2, IPCR1, ISEQID: 3, IDATSZ: 4);
+    ral::write_reg!(ral::flexspi, flexspi2, IPCMD, TRG: 1);
+    while ral::read_reg!(ral::flexspi, flexspi2, INTR, IPCMDDONE) == 0 {}
+    let id = flexspi2.RFDR[0].read();
+    ral::write_reg!(ral::flexspi, flexspi2, INTR, IPCMDDONE: 1, IPRXWA: 1);
+    id
+}
+
+unsafe fn flexspi2_psram_size(
+    flexspi2: &ral::flexspi::Instance<2>,
+    addr: u32,
+) -> u8 {
+    flexspi2_command(flexspi2, 0, addr);
+    flexspi2_command(flexspi2, 1, addr);
+    flexspi2_command(flexspi2, 2, addr);
+
+    let id = flexspi2_psram_id(flexspi2, addr);
+
+    // Parse PSRAM device ID (protocol-level, not register fields)
+    match id & 0xFFFF {
+        0x5D0D => 8,    // AP/Lyontek
+        0x5D9D => {     // ISSI
+            match (id >> 21) & 0x7 {
+                0b011 => 8,
+                0b100 => 16,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Initialize PSRAM via FlexSPI2 on the Teensy 4.1.
+///
+/// Configures the FlexSPI2 peripheral, pad muxing, and clock for the
+/// on-board PSRAM chip (APS6404L-3SQR or compatible). After a
+/// successful return, PSRAM is memory-mapped at [`PSRAM_BASE`]
+/// (`0x7000_0000`).
+///
+/// Consumes the `flexspi2` instance to prevent further direct access
+/// to the peripheral after PSRAM is initialized.
+///
+/// Returns the total PSRAM size in megabytes (typically 8 or 16),
+/// or 0 if no PSRAM chip was detected.
+///
+/// # Safety
+///
+/// Must be called once during early initialization, before any PSRAM
+/// access. Modifies IOMUXC and FlexSPI2 peripheral registers. The
+/// FlexSPI2 clock must already be configured (this is done
+/// automatically by [`prepare_clocks_and_power`]).
+pub unsafe fn init_psram(flexspi2: ral::flexspi::FLEXSPI2) -> u8 {
+    let iomuxc = ral::iomuxc::IOMUXC::instance();
+
+    // ---- Pad configuration ----
+    // 8 pads on GPIO_EMC_22..29, all ALT8 for FlexSPI2 port A.
+    // All high-speed: HYS=1, DSE=7(R0/7), SPEED=3(200MHz), SRE=1(fast).
+    // Pull-up varies per pin function.
+
+    // EMC_22 (FlexSPI2_A_SS1_B): 100K pull-up
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_22,
+        HYS: 1, PUS: 2, PUE: 1, PKE: 1, DSE: 7, SPEED: 3, SRE: 1);
+    // EMC_23 (FlexSPI2_A_DQS): keeper only
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_23,
+        HYS: 1, PKE: 1, DSE: 7, SPEED: 3, SRE: 1);
+    // EMC_24 (FlexSPI2_A_SS0_B): 100K pull-up
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_24,
+        HYS: 1, PUS: 2, PUE: 1, PKE: 1, DSE: 7, SPEED: 3, SRE: 1);
+    // EMC_25 (FlexSPI2_A_SCLK): no pull
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_25,
+        HYS: 1, DSE: 7, SPEED: 3, SRE: 1);
+    // EMC_26..29 (FlexSPI2_A_DATA0..3): 47K pull-up
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_26,
+        HYS: 1, PUS: 1, PUE: 1, PKE: 1, DSE: 7, SPEED: 3, SRE: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_27,
+        HYS: 1, PUS: 1, PUE: 1, PKE: 1, DSE: 7, SPEED: 3, SRE: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_28,
+        HYS: 1, PUS: 1, PUE: 1, PKE: 1, DSE: 7, SPEED: 3, SRE: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_PAD_CTL_PAD_GPIO_EMC_29,
+        HYS: 1, PUS: 1, PUE: 1, PKE: 1, DSE: 7, SPEED: 3, SRE: 1);
+
+    // Mux: ALT8 + SION for all FlexSPI2 pads
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_22, MUX_MODE: 8, SION: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_23, MUX_MODE: 8, SION: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_24, MUX_MODE: 8, SION: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_25, MUX_MODE: 8, SION: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_26, MUX_MODE: 8, SION: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_27, MUX_MODE: 8, SION: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_28, MUX_MODE: 8, SION: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, SW_MUX_CTL_PAD_GPIO_EMC_29, MUX_MODE: 8, SION: 1);
+
+    // Input daisy chains: select GPIO_EMC path
+    ral::write_reg!(ral::iomuxc, iomuxc, FLEXSPI2_IPP_IND_DQS_FA_SELECT_INPUT, DAISY: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, FLEXSPI2_IPP_IND_IO_FA_BIT0_SELECT_INPUT, DAISY: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, FLEXSPI2_IPP_IND_IO_FA_BIT1_SELECT_INPUT, DAISY: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, FLEXSPI2_IPP_IND_IO_FA_BIT2_SELECT_INPUT, DAISY: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, FLEXSPI2_IPP_IND_IO_FA_BIT3_SELECT_INPUT, DAISY: 1);
+    ral::write_reg!(ral::iomuxc, iomuxc, FLEXSPI2_IPP_IND_SCK_FA_SELECT_INPUT, DAISY: 1);
+
+    // ---- FlexSPI2 peripheral configuration ----
+
+    // Disable module during configuration
+    ral::modify_reg!(ral::flexspi, flexspi2, MCR0, MDIS: 1);
+
+    // MCR0: max timeouts, RXCLKSRC=1 (loopback from DQS pad)
+    ral::modify_reg!(ral::flexspi, flexspi2, MCR0,
+        AHBGRANTWAIT: 0xFF, IPGRANTWAIT: 0xFF,
+        SCKFREERUNEN: 0, COMBINATIONEN: 0, DOZEEN: 0, HSEN: 0,
+        ATDFEN: 0, ARDFEN: 0, RXCLKSRC: 1, MDIS: 1, SWRESET: 0);
+
+    ral::write_reg!(ral::flexspi, flexspi2, MCR1,
+        SEQWAIT: 0xFFFF, AHBBUSWAIT: 0xFFFF);
+
+    ral::modify_reg!(ral::flexspi, flexspi2, MCR2,
+        RESUMEWAIT: 0x20, SCKBDIFFOPT: 0, SAMEDEVICEEN: 0,
+        CLRLEARNPHASE: 0, CLRAHBBUFOPT: 0);
+
+    ral::modify_reg!(ral::flexspi, flexspi2, AHBCR,
+        READADDROPT: 0, PREFETCHEN: 0, BUFFERABLEEN: 0, CACHABLEEN: 0);
+
+    // AHB RX buffers 0/1: prefetch enabled, 64 x 64-bit = 512 bytes each
+    ral::modify_reg!(ral::flexspi, flexspi2, AHBRXBUF0CR0,
+        PREFETCHEN: 1, PRIORITY: 0, MSTRID: 0, BUFSZ: 64);
+    ral::modify_reg!(ral::flexspi, flexspi2, AHBRXBUF1CR0,
+        PREFETCHEN: 1, PRIORITY: 0, MSTRID: 0, BUFSZ: 64);
+    // AHB RX buffers 2/3: all features enabled, max size
+    ral::write_reg!(ral::flexspi, flexspi2, AHBRXBUF2CR0,
+        PREFETCHEN: 1, PRIORITY: 3, MSTRID: 0xF, BUFSZ: 0xFF);
+    ral::write_reg!(ral::flexspi, flexspi2, AHBRXBUF3CR0,
+        PREFETCHEN: 1, PRIORITY: 3, MSTRID: 0xF, BUFSZ: 0xFF);
+
+    ral::write_reg!(ral::flexspi, flexspi2, IPRXFCR, CLRIPRXF: 1);
+    ral::write_reg!(ral::flexspi, flexspi2, IPTXFCR, CLRIPTXF: 1);
+    ral::write_reg!(ral::flexspi, flexspi2, INTEN, 0);
+
+    // FLSHCR1/2 are array registers — use named offsets from RAL field modules.
+    // FLSHCR1 A1/A2: TCSH=1 cycle CS hold, TCSS=1 cycle CS setup
+    let flshcr1: u32 = (1 << ral::flexspi::FLSHCR1::TCSH::offset)
+        | (1 << ral::flexspi::FLSHCR1::TCSS::offset);
+    flexspi2.FLSHCR1[0].write(flshcr1);
+    flexspi2.FLSHCR1[1].write(flshcr1);
+    // FLSHCR2 A1/A2: AWRSEQID=6 (QPI write), ARDSEQID=5 (QPI read)
+    let flshcr2: u32 = (6 << ral::flexspi::FLSHCR2::AWRSEQID::offset)
+        | (5 << ral::flexspi::FLSHCR2::ARDSEQID::offset);
+    flexspi2.FLSHCR2[0].write(flshcr2);
+    flexspi2.FLSHCR2[1].write(flshcr2);
+
+    // Enable module
+    ral::modify_reg!(ral::flexspi, flexspi2, MCR0, MDIS: 0);
+
+    // ---- LUT programming ----
+    ral::write_reg!(ral::flexspi, flexspi2, LUTKEY, KEY: 0x5AF05AF0);
+    ral::write_reg!(ral::flexspi, flexspi2, LUTCR, UNLOCK: 1);
+
+    for i in 0..64 {
+        flexspi2.LUT[i].write(0);
+    }
+
+    // Software reset
+    ral::modify_reg!(ral::flexspi, flexspi2, MCR0, SWRESET: 1);
+    while ral::read_reg!(ral::flexspi, flexspi2, MCR0, SWRESET) != 0 {}
+
+    ral::write_reg!(ral::flexspi, flexspi2, LUTKEY, KEY: 0x5AF05AF0);
+    ral::write_reg!(ral::flexspi, flexspi2, LUTCR, UNLOCK: 1);
+
+    // LUT sequences (instruction encoding, not register fields)
+    // Seq 0: Exit QPI mode
+    flexspi2.LUT[0].write(lut_word(lut_instr(FLEXSPI_CMD_SDR, FLEXSPI_PADS_4, 0xF5), 0));
+    // Seq 1: Reset Enable
+    flexspi2.LUT[4].write(lut_word(lut_instr(FLEXSPI_CMD_SDR, FLEXSPI_PADS_1, 0x66), 0));
+    // Seq 2: Reset
+    flexspi2.LUT[8].write(lut_word(lut_instr(FLEXSPI_CMD_SDR, FLEXSPI_PADS_1, 0x99), 0));
+    // Seq 3: Read ID
+    flexspi2.LUT[12].write(lut_word(
+        lut_instr(FLEXSPI_CMD_SDR, FLEXSPI_PADS_1, 0x9F),
+        lut_instr(FLEXSPI_DUMMY_SDR, FLEXSPI_PADS_1, 24),
+    ));
+    flexspi2.LUT[13].write(lut_word(lut_instr(FLEXSPI_READ_SDR, FLEXSPI_PADS_1, 1), 0));
+    // Seq 4: Enter QPI mode
+    flexspi2.LUT[16].write(lut_word(lut_instr(FLEXSPI_CMD_SDR, FLEXSPI_PADS_1, 0x35), 0));
+    // Seq 5: QPI Fast Read
+    flexspi2.LUT[20].write(lut_word(
+        lut_instr(FLEXSPI_CMD_SDR, FLEXSPI_PADS_4, 0xEB),
+        lut_instr(FLEXSPI_RADDR_SDR, FLEXSPI_PADS_4, 24),
+    ));
+    flexspi2.LUT[21].write(lut_word(
+        lut_instr(FLEXSPI_DUMMY_SDR, FLEXSPI_PADS_4, 6),
+        lut_instr(FLEXSPI_READ_SDR, FLEXSPI_PADS_4, 1),
+    ));
+    // Seq 6: QPI Write
+    flexspi2.LUT[24].write(lut_word(
+        lut_instr(FLEXSPI_CMD_SDR, FLEXSPI_PADS_4, 0x38),
+        lut_instr(FLEXSPI_RADDR_SDR, FLEXSPI_PADS_4, 24),
+    ));
+    flexspi2.LUT[25].write(lut_word(lut_instr(FLEXSPI_WRITE_SDR, FLEXSPI_PADS_4, 1), 0));
+
+    // ---- PSRAM detection ----
+    let size1 = flexspi2_psram_size(&flexspi2, 0);
+    if size1 == 0 {
+        return 0;
+    }
+
+    ral::write_reg!(ral::flexspi, flexspi2, FLSHA1CR0, FLSHSZ: (size1 as u32) * 1024);
+    flexspi2_command(&flexspi2, 4, 0);
+
+    let size2 = flexspi2_psram_size(&flexspi2, size1 as u32 * 1024 * 1024);
+    if size2 > 0 {
+        ral::write_reg!(ral::flexspi, flexspi2, FLSHA2CR0, FLSHSZ: (size2 as u32) * 1024);
+        flexspi2_command(&flexspi2, 4, size1 as u32 * 1024 * 1024);
+    }
+
+    size1 + size2
+}
+
+/// Validate PSRAM by writing and reading back a test pattern.
+///
+/// Tests `size` bytes starting at [`PSRAM_BASE`]. Returns `true` if
+/// all bytes match.
+pub fn validate_psram(size: usize) -> bool {
+    let base = PSRAM_BASE as *mut u8;
+    for i in 0..size {
+        unsafe { base.add(i).write_volatile((i & 0xFF) as u8) };
+    }
+    for i in 0..size {
+        let val = unsafe { base.add(i).read_volatile() };
+        if val != (i & 0xFF) as u8 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Get a mutable slice view of PSRAM.
+///
+/// # Safety
+///
+/// Caller must ensure:
+/// - PSRAM has been initialized via [`init_psram`]
+/// - `offset + len` does not exceed the detected PSRAM size
+/// - No other code holds an aliasing reference to the same region
+pub unsafe fn psram_as_mut_slice(offset: usize, len: usize) -> &'static mut [u8] {
+    let ptr = (PSRAM_BASE + offset) as *mut u8;
+    core::slice::from_raw_parts_mut(ptr, len)
 }
