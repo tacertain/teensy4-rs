@@ -30,14 +30,15 @@ fn main() -> ! {
         pins,
         mut gpio2,
         flexspi2,
+        mut iomuxc,
         ..
     } = board::t41(board::instances());
     let led = board::led(&mut gpio2, pins.p13);
     let mut delay = Blocking::<_, { board::PERCLK_FREQUENCY }>::from_pit(pit.0);
 
     // Initialize PSRAM and copy .psram.data from flash
-    let token = match unsafe { board::initialize_psram(flexspi2) } {
-        Ok(token) => token,
+    let token = match board::initialize_psram(flexspi2, &mut iomuxc, Default::default()) {
+        Ok(psram) => psram.token(),
         Err(_) => {
             led.clear();
             loop {

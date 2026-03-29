@@ -299,12 +299,18 @@ pub struct Resources<Pins> {
     pub sai3: ral::sai::SAI3,
     /// The IOMUXC general purpose register block.
     pub iomuxc_gpr: ral::iomuxc_gpr::IOMUXC_GPR,
+    /// The IOMUXC register block.
+    ///
+    /// Pass a mutable reference to [`initialize_psram`] to configure the
+    /// FlexSPI2 pad mux. The typed pins in [`Self::pins`] also cover IOMUXC
+    /// registers, but target different pads (EMC_22..29 are dedicated to
+    /// the on-board PSRAM chip on T4.1).
+    pub iomuxc: ral::iomuxc::IOMUXC,
     /// The FlexSPI2 peripheral instance.
     ///
     /// On the Teensy 4.1, FlexSPI2 is connected to the on-board PSRAM
-    /// chip(s). Pass this to [`initialize_psram`] (or [`init_psram`])
-    /// to initialize PSRAM; doing so consumes the instance, preventing
-    /// accidental misuse of the peripheral after initialization.
+    /// chip(s). Pass this together with [`Self::iomuxc`] to
+    /// [`initialize_psram`]
     pub flexspi2: ral::flexspi::FLEXSPI2,
 }
 
@@ -600,6 +606,11 @@ fn prepare_resources<Pins>(
     );
     let iomuxc = hal::iomuxc::into_pads(instances.IOMUXC);
     let pins = from_pads(iomuxc);
+    // SAFETY: instances.IOMUXC was consumed by into_pads above. This
+    // second instance covers the same peripheral, but is only ever used
+    // for the FlexSPI2 pad configuration in initialize_psram (EMC_22..29),
+    // which are not vended as typed pins by this BSP.
+    let iomuxc_raw = unsafe { ral::iomuxc::IOMUXC::instance() };
 
     // Stop timers in debug mode.
     ral::modify_reg!(ral::pit, instances.PIT, MCR, FRZ: FRZ_1);
@@ -684,6 +695,7 @@ fn prepare_resources<Pins>(
         sai2: instances.SAI2,
         sai3: instances.SAI3,
         iomuxc_gpr: instances.IOMUXC_GPR,
+        iomuxc: iomuxc_raw,
         flexspi2: instances.FLEXSPI2,
     }
 }
@@ -718,7 +730,7 @@ pub fn tmm(instances: impl Into<Instances>) -> TMMResources {
 
 /// Zero-sized token proving that PSRAM has been initialized.
 ///
-/// Returned by [`initialize_psram`] on success. Pass this to
+/// Returned via [`Psram::token`] on success. Pass this to
 /// [`PsramStatic::take`](crate::PsramStatic::take) to obtain
 /// references to PSRAM-backed statics declared with
 /// [`psram_static!`](crate::psram_static).
@@ -728,6 +740,66 @@ pub fn tmm(instances: impl Into<Instances>) -> TMMResources {
 /// not by the token.
 #[derive(Clone, Copy, Debug)]
 pub struct PsramToken(());
+
+/// AHB bus configuration for the FlexSPI2 PSRAM interface.
+///
+/// Passed to [`initialize_psram`]. All fields default to `false`.
+///
+/// # Notes on caching
+///
+/// Setting `ahb_cacheable` instructs the FlexSPI2 controller to mark
+/// AHB reads as cacheable on the bus. Combined with the Cortex-M7
+/// default memory map (which treats `0x7000_0000` as Normal Cacheable),
+/// this enables the D-cache and hardware prefetcher for PSRAM reads.
+///
+/// When caching is enabled, DMA coherency becomes the caller's
+/// responsibility: cache lines must be invalidated before reading
+/// DMA-filled buffers, and flushed before DMA reads them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PsramConfig {
+    /// Enable AHB read prefetch in the FlexSPI2 controller.
+    ///
+    /// The controller speculatively issues read commands to PSRAM for
+    /// the next cache line when sequential AHB traffic is detected.
+    /// Independent of the Cortex-M7 hardware prefetcher.
+    pub ahb_prefetch: bool,
+    /// Allow AHB writes to be buffered.
+    pub ahb_bufferable: bool,
+    /// Mark PSRAM AHB reads as cacheable, enabling the Cortex-M7
+    /// D-cache and hardware prefetcher for the PSRAM region.
+    pub ahb_cacheable: bool,
+}
+
+/// Handle to the initialized PSRAM peripheral.
+///
+/// Returned by [`initialize_psram`]. Holds the `FLEXSPI2` instance
+/// to allow runtime reconfiguration of AHB bus settings via
+/// [`set_ahb_config`](Psram::set_ahb_config).
+///
+/// Call [`token`](Psram::token) to obtain a [`PsramToken`] for
+/// accessing PSRAM-backed statics.
+#[cfg(feature = "psram")]
+pub struct Psram {
+    flexspi2: ral::flexspi::FLEXSPI2,
+    token: PsramToken,
+}
+
+#[cfg(feature = "psram")]
+impl Psram {
+    /// Returns the token proving PSRAM has been initialized.
+    pub fn token(&self) -> PsramToken {
+        self.token
+    }
+
+    /// Reconfigure the FlexSPI2 AHB bus settings at runtime.
+    ///
+    /// Takes effect on the next AHB transaction. Safe to call any
+    /// number of times after initialization.
+    pub fn set_ahb_config(&mut self, config: PsramConfig) {
+        // SAFETY: we own flexspi2, ensuring exclusive register access.
+        unsafe { apply_psram_ahb_config(&self.flexspi2, config) }
+    }
+}
 
 /// Errors from [`initialize_psram`].
 #[derive(Debug)]
@@ -744,15 +816,27 @@ pub enum PsramError {
     },
 }
 
+/// Apply AHB bus configuration to the FlexSPI2 controller.
+unsafe fn apply_psram_ahb_config(
+    flexspi2: &ral::flexspi::Instance<2>,
+    config: PsramConfig,
+) {
+    ral::modify_reg!(ral::flexspi, flexspi2, AHBCR,
+        PREFETCHEN:   config.ahb_prefetch   as u32,
+        BUFFERABLEEN: config.ahb_bufferable as u32,
+        CACHABLEEN:   config.ahb_cacheable  as u32);
+}
+
 /// Initialize PSRAM and copy initializer data from flash.
 ///
-/// Configures FlexSPI2, detects installed PSRAM, and copies the
-/// `.psram.data` section contents from flash (LMA) into PSRAM (VMA).
-/// On success, returns a [`PsramToken`] that can be used to access
-/// PSRAM-backed statics.
+/// Configures FlexSPI2, detects installed PSRAM, copies the
+/// `.psram.data` section from flash (LMA) into PSRAM (VMA), and
+/// applies `config`. On success, returns a [`Psram`] handle.
 ///
-/// Consumes the `FLEXSPI2` instance to prevent further direct use
-/// of the peripheral after initialization.
+/// Consumes the `FLEXSPI2` instance; it is stored in the returned
+/// [`Psram`] and can be used to reconfigure AHB settings later.
+/// Borrows `iomuxc` exclusively to configure the FlexSPI2 pad mux and
+/// daisy-chain select registers; the borrow is released on return.
 ///
 /// # Errors
 ///
@@ -760,17 +844,17 @@ pub enum PsramError {
 /// Returns [`PsramError::SectionOverflow`] if the `.psram.data`
 /// section is larger than the detected capacity.
 ///
-/// # Safety
+/// # Note
 ///
-/// Must be called once during early initialization, before any PSRAM
-/// access. Modifies IOMUXC and FlexSPI2 peripheral registers. The
-/// FlexSPI2 clock must already be configured (this is done
-/// automatically by [`prepare_clocks_and_power`]).
+/// The FlexSPI2 clock must already be configured. This is done
+/// automatically by [`prepare_clocks_and_power`].
 #[cfg(feature = "psram")]
-pub unsafe fn initialize_psram(
+pub fn initialize_psram(
     flexspi2: ral::flexspi::FLEXSPI2,
-) -> Result<PsramToken, PsramError> {
-    let size_mb = init_psram(flexspi2);
+    iomuxc: &mut ral::iomuxc::IOMUXC,
+    config: PsramConfig,
+) -> Result<Psram, PsramError> {
+    let size_mb = unsafe { init_psram_hw(&flexspi2, iomuxc) };
     if size_mb == 0 {
         return Err(PsramError::NotDetected);
     }
@@ -792,9 +876,15 @@ pub unsafe fn initialize_psram(
         static __sipsram_data: u8;
     }
 
-    let vma_start = &__spsram_data as *const u8;
-    let vma_end = &__epsram_data as *const u8;
-    let lma_start = &__sipsram_data as *const u8;
+    // SAFETY: These linker symbols are defined by psram.x and point into
+    // valid flash (LMA) and PSRAM (VMA) regions.
+    let (vma_start, vma_end, lma_start) = unsafe {
+        (
+            &__spsram_data as *const u8,
+            &__epsram_data as *const u8,
+            &__sipsram_data as *const u8,
+        )
+    };
     let section_size = vma_end as usize - vma_start as usize;
 
     if section_size > detected_bytes {
@@ -806,10 +896,15 @@ pub unsafe fn initialize_psram(
 
     // Copy initializer data from flash to PSRAM.
     if section_size > 0 {
-        core::ptr::copy_nonoverlapping(lma_start, vma_start as *mut u8, section_size);
+        // SAFETY: src (flash LMA) and dst (PSRAM VMA) are non-overlapping
+        // regions of the correct length.
+        unsafe { core::ptr::copy_nonoverlapping(lma_start, vma_start as *mut u8, section_size) };
     }
 
-    Ok(PsramToken(()))
+    // SAFETY: flexspi2 is valid; we own it and init_psram_hw completed.
+    unsafe { apply_psram_ahb_config(&flexspi2, config) };
+
+    Ok(Psram { flexspi2, token: PsramToken(()) })
 }
 
 /// PSRAM memory-mapped base address.
@@ -910,7 +1005,12 @@ unsafe fn flexspi2_psram_size(
 /// FlexSPI2 clock must already be configured (this is done
 /// automatically by [`prepare_clocks_and_power`]).
 pub unsafe fn init_psram(flexspi2: ral::flexspi::FLEXSPI2) -> u8 {
-    let iomuxc = ral::iomuxc::IOMUXC::instance();
+    let mut iomuxc = ral::iomuxc::IOMUXC::instance();
+    init_psram_hw(&flexspi2, &mut iomuxc)
+}
+
+/// Inner implementation that borrows FlexSPI2 so the caller can retain ownership.
+unsafe fn init_psram_hw(flexspi2: &ral::flexspi::Instance<2>, iomuxc: &mut ral::iomuxc::IOMUXC) -> u8 {
 
     // ---- Pad configuration ----
     // 8 pads on GPIO_EMC_22..29, all ALT8 for FlexSPI2 port A.
@@ -975,8 +1075,9 @@ pub unsafe fn init_psram(flexspi2: ral::flexspi::FLEXSPI2) -> u8 {
         RESUMEWAIT: 0x20, SCKBDIFFOPT: 0, SAMEDEVICEEN: 0,
         CLRLEARNPHASE: 0, CLRAHBBUFOPT: 0);
 
-    ral::modify_reg!(ral::flexspi, flexspi2, AHBCR,
-        READADDROPT: 0, PREFETCHEN: 0, BUFFERABLEEN: 0, CACHABLEEN: 0);
+    // AHB bus config (prefetch, bufferable, cacheable) is applied
+    // separately via apply_psram_ahb_config / Psram::set_ahb_config.
+    ral::modify_reg!(ral::flexspi, flexspi2, AHBCR, READADDROPT: 0);
 
     // AHB RX buffers 0/1: prefetch enabled, 64 x 64-bit = 512 bytes each
     ral::modify_reg!(ral::flexspi, flexspi2, AHBRXBUF0CR0,

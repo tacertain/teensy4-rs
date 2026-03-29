@@ -1,4 +1,3 @@
-use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -11,7 +10,7 @@ use crate::board::PsramToken;
 /// [`PsramStatic`].
 #[repr(transparent)]
 #[doc(hidden)]
-pub struct PsramData<T>(UnsafeCell<MaybeUninit<T>>);
+pub struct PsramData<T>(MaybeUninit<T>);
 
 // SAFETY: PsramData is only accessed through PsramStatic, which
 // enforces one-shot exclusive access via AtomicBool.
@@ -25,7 +24,7 @@ impl<T> PsramData<T> {
     /// `initialize_psram` copies it to the VMA (PSRAM) at runtime.
     #[doc(hidden)]
     pub const fn __new(val: T) -> Self {
-        Self(UnsafeCell::new(MaybeUninit::new(val)))
+        Self(MaybeUninit::new(val))
     }
 }
 
@@ -88,13 +87,14 @@ impl<T> PsramStatic<T> {
         {
             // SAFETY:
             // - PsramToken guarantees initialize_psram completed, so the
-            //   data has been copied from flash into PSRAM.
+            //   data has been copied from flash into PSRAM and is initialized.
             // - compare_exchange succeeded, so this is the first and only
             //   call, guaranteeing no aliasing.
             // - The 'static lifetime is sound because the underlying
             //   storage is a true static in the .psram.data section.
-            let data = unsafe { &*self.data };
-            Some(unsafe { &mut *(*data.0.get()).as_mut_ptr() })
+            // - PsramData<T> is repr(transparent) over MaybeUninit<T>,
+            //   which has the same size and alignment as initialized T.
+            Some(unsafe { &mut *(self.data as *mut T) })
         } else {
             None
         }
@@ -126,8 +126,14 @@ impl<T> PsramStatic<T> {
 ///
 /// # #[bsp::rt::entry]
 /// # fn main() -> ! {
-/// let resources = board::t41(board::instances());
-/// let token = unsafe { board::initialize_psram(resources.flexspi2) }.unwrap();
+/// let mut resources = board::t41(board::instances());
+/// let token = board::initialize_psram(
+///     resources.flexspi2,
+///     &mut resources.iomuxc,
+///     Default::default(),
+/// )
+/// .unwrap()
+/// .token();
 ///
 /// let buf: &'static mut [u8; 1024] = BUFFER.take(token).unwrap();
 /// # loop {}
